@@ -1,0 +1,31 @@
+{
+    "configurations": [
+        {
+            "name": "run all",
+            "command": "./launch.sh",
+            "term_opts": {
+                "close_on_exit": true
+            },
+            "default": true
+        },
+        {
+            "name": "Launch",
+            "command": "cargo run",
+            "args": "1047"
+        },
+        {
+            "name": "Debug",
+            "type": "rt_lldb",
+            "request": "launch",
+            "program": "${workspaceRoot}/target/debug/${workspaceRootBasename}",
+            "pre_launch": "build"
+        },
+        {
+            "name": "build",
+            "command": "cargo build",
+            "term_opts": {
+                "close_on_exit": true
+            }
+        }
+    ]
+}

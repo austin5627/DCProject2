@@ -10,13 +10,13 @@
 #
 # Format is:
 # UID Hostname Port
-5 localhost 5234
+5   localhost 5234
 200 localhost 6213
-8 localhost 4223
+8   localhost 4223
 184 localhost 3262
-9 localhost 4293
-37 localhost 7245
-78 localhost 9286
+9   localhost 4293
+37  localhost 7245
+78  localhost 9286
 # List of edges and their weight, one per line. An edge is denoted
 # by (smaller uid, larger uid)
 (5,200) 5

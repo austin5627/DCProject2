@@ -1,18 +1,14 @@
-extern crate bincode;
-extern crate serde;
-
-use std::cmp::{max, min};
 use std::collections::{HashMap, HashSet};
 use std::env::args;
+use std::fmt::{Debug, Display};
 use std::io::{Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 
 use std::thread::sleep;
 use std::time::Duration;
 
+use owo_colors::OwoColorize;
 use serde::{Deserialize, Serialize};
-
-const MAX_MESSAGE_SIZE: usize = 4096;
 
 #[derive(Debug)]
 struct Node {
@@ -34,9 +30,33 @@ enum MessageType {
     // (min id, min weight)
     Search,
     // take me to your leader!
-    Response(i32),
-    // (component id)
+    Response(i32, i32),
+    // (component id, other node)
     Join,
+}
+
+impl Display for MessageType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MessageType::Sync => write!(f, "{}", "Sync".red()),
+            MessageType::Stop => write!(f, "{}", "Stop".red()),
+            MessageType::Done => write!(f, "{}", "Done".red()),
+            MessageType::BroadcastNewLeader(id) => {
+                write!(f, "{}({})", "BroadcastNewLeader".blue(), id)
+            }
+            MessageType::ConvergeMinWeight(id, weight) => {
+                write!(f, "{}({}, {})", "ConvergeMinWeight".purple(), id, weight)
+            }
+            MessageType::BroadcastMinWeight(id, weight) => {
+                write!(f, "{}({}, {})", "BroadcastMinWeight".blue(), id, weight)
+            }
+            MessageType::Search => write!(f, "{}", "Search".yellow()),
+            MessageType::Response(comp_id, other_id) => {
+                write!(f, "{}({} {})", "Response".green(), comp_id, other_id)
+            }
+            MessageType::Join => write!(f, "{}", "Join".cyan()),
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -48,16 +68,19 @@ struct Message {
 
 fn send_message(msg: Message, stream: &mut TcpStream) {
     let bytes: Vec<u8> = msg.into();
+    let len = bytes.len() as u32;
+    let len_bytes = len.to_le_bytes();
+    stream.write(&len_bytes).expect("Unable to write to stream");
     stream.write(&bytes).expect("Unable to write to stream");
 }
 
 fn recv_message(stream: &mut TcpStream) -> Option<Message> {
-    let mut buf = vec![0; MAX_MESSAGE_SIZE];
-    let n = stream.read(&mut buf).expect("Unable to read from stream");
-    if n == 0 {
-        return None;
-    }
-    let msg: Message = buf[..n].into();
+    let mut len_bytes = [0; 4];
+    stream.read_exact(&mut len_bytes).ok()?;
+    let len = u32::from_le_bytes(len_bytes);
+    let mut bytes = vec![0; len as usize];
+    stream.read_exact(&mut bytes).ok()?;
+    let msg: Message = bytes[..].into();
     Some(msg)
 }
 
@@ -148,7 +171,7 @@ fn connect_to_neighbors(node_id: i32, nodes: &HashMap<i32, Node>) -> HashMap<i32
         TcpListener::bind(format!("{}:{}", node.ip, node.port)).expect("Unable to bind to port");
     let mut listeners = HashMap::new();
     for (neighbor, _) in &node.edges {
-        let socket: TcpStream;
+        let mut socket: TcpStream;
         let addr: SocketAddr;
         if node_id < *neighbor {
             loop {
@@ -171,9 +194,19 @@ fn connect_to_neighbors(node_id: i32, nodes: &HashMap<i32, Node>) -> HashMap<i32
             socket = conn.0;
             addr = conn.1;
         }
-        println!("Connection established with {}", addr);
+        send_message(
+            Message {
+                msg_type: MessageType::Sync,
+                sender: node_id,
+                receiver: *neighbor,
+            },
+            &mut socket.try_clone().expect("Unable to clone socket"),
+        );
+        let msg = recv_message(&mut socket).expect("Unable to receive message");
+        let connected_node_id = msg.sender;
+        println!("Connection established with {} {}", addr, connected_node_id);
 
-        listeners.insert(*neighbor, socket);
+        listeners.insert(connected_node_id, socket);
     }
     return listeners;
 }
@@ -190,9 +223,12 @@ fn sync_ghs(nodes: &HashMap<i32, Node>, node_id: i32) {
     let mut last_edge_checked = 0;
 
     let mut min_weight_out_edge = node.edges[0];
-    let mut global_min_weight_out_edge: (i32, i32) = (-1, -1); // (node_id, weight)
+    let mut global_min_weight_out_edge: (i32, i32) = (-1, i32::MAX); // (node_id, weight)
     let mut weights_received: HashSet<i32> = HashSet::new();
-    let mut start_next_level = false;
+    let mut start_next_phase = false;
+    let mut phase = 0;
+    let mut done = HashSet::new();
+    let mut stop = HashSet::new();
 
     // Send search message to first neighbor and sync to the rest
     let mut i = 0;
@@ -209,13 +245,15 @@ fn sync_ghs(nodes: &HashMap<i32, Node>, node_id: i32) {
             sender: node_id,
             receiver: *neighbor,
         };
-        println!("Sending {:?} message to {}", msg.msg_type, neighbor);
+        println!("Sending {} to {}", msg.msg_type, neighbor);
         send_message(
             msg,
             streams.get_mut(neighbor).expect("Unable to get stream"),
         );
     }
+    let mut round = 0;
     loop {
+        round += 1;
         // Send search message to neighbors
         // Receive response from neighbors
         // Store min weight edge from neighbor in other component
@@ -225,8 +263,19 @@ fn sync_ghs(nodes: &HashMap<i32, Node>, node_id: i32) {
         // if node with min weight edge, send join message to external neighbor with min weight edge
         // if both sender and receiver of join message you are new leader, send broadcast new leader message to all tree neighbors
         // if receive broadcast new leader message, update leader and parent, continue broadcast to all tree neighbors
-        if last_edge_checked == node.edges.len() as i32 {
-            println!("All edges checked, breaking");
+
+        if done.len() == node.edges.len() && stop.len() == node.edges.len() {
+            println!("All neighbors done, breaking");
+            for (id, stream) in &mut streams {
+                send_message(
+                    Message {
+                        msg_type: MessageType::Stop,
+                        sender: node_id,
+                        receiver: *id,
+                    },
+                    stream,
+                );
+            }
             break;
         }
 
@@ -234,15 +283,20 @@ fn sync_ghs(nodes: &HashMap<i32, Node>, node_id: i32) {
         for (id, stream) in &mut streams {
             if let Some(msg) = recv_message(stream) {
                 if msg.msg_type != MessageType::Sync {
-                    println!("Received message: {:?}", msg);
-                    println!("Current component: {}", leader);
-                    println!("Current span edges: {:?}", span_edges);
+                    println!(
+                        "Received message: {} from {} round {}",
+                        msg.msg_type, msg.sender, round
+                    );
+                    println!("\tCurrent component: {}", leader);
+                    println!("\tCurrent span edges: {:?}", span_edges);
+                } else {
+                    print!("\r");
                 }
                 match msg.msg_type {
-                    MessageType::Response(component_id) => {
+                    MessageType::Response(component_id, _) => {
                         if component_id != leader {
-                            min_weight_out_edge = node.edges[(last_edge_checked + 1) as usize];
-                            println!("Found min weight edge: {:?}", min_weight_out_edge);
+                            min_weight_out_edge = node.edges[(last_edge_checked) as usize];
+                            println!("\tFound min weight edge: {:?}", min_weight_out_edge);
                             if span_edges.len() == 0 {
                                 to_send.insert(
                                     *id,
@@ -257,20 +311,24 @@ fn sync_ghs(nodes: &HashMap<i32, Node>, node_id: i32) {
                                 to_send.insert(
                                     parent,
                                     Message {
-                                        msg_type: MessageType::ConvergeMinWeight(min_weight_out_edge.0, min_weight_out_edge.1),
+                                        msg_type: MessageType::ConvergeMinWeight(
+                                            node_id,
+                                            min_weight_out_edge.1,
+                                        ),
                                         sender: node_id,
                                         receiver: parent,
                                     },
                                 );
                             }
-                        } else {
+                        } else if last_edge_checked < node.edges.len() as i32 - 1 {
                             last_edge_checked += 1;
+                            let recipient = node.edges[last_edge_checked as usize].0;
                             to_send.insert(
-                                *id,
+                                recipient,
                                 Message {
                                     msg_type: MessageType::Search,
                                     sender: node_id,
-                                    receiver: *id,
+                                    receiver: recipient,
                                 },
                             );
                         }
@@ -279,7 +337,7 @@ fn sync_ghs(nodes: &HashMap<i32, Node>, node_id: i32) {
                         to_send.insert(
                             *id,
                             Message {
-                                msg_type: MessageType::Response(leader),
+                                msg_type: MessageType::Response(leader, *id),
                                 sender: node_id,
                                 receiver: *id,
                             },
@@ -288,7 +346,8 @@ fn sync_ghs(nodes: &HashMap<i32, Node>, node_id: i32) {
                     MessageType::BroadcastNewLeader(leader_id) => {
                         leader = leader_id;
                         parent = *id;
-                        start_next_level = true;
+                        start_next_phase = true;
+                        println!("\tNew leader: {} my parent: {}", leader, parent);
                         for n in &span_edges {
                             if *n != parent {
                                 to_send.insert(
@@ -302,11 +361,11 @@ fn sync_ghs(nodes: &HashMap<i32, Node>, node_id: i32) {
                             }
                         }
                     }
-                    MessageType::ConvergeMinWeight(node_id, weight) => {
+                    MessageType::ConvergeMinWeight(min_id, weight) => {
                         if weight < global_min_weight_out_edge.1 {
-                            global_min_weight_out_edge = (node_id, weight);
+                            global_min_weight_out_edge = (min_id, weight);
                         }
-                        weights_received.insert(node_id);
+                        weights_received.insert(min_id);
                         if weights_received.len() == span_edges.len() - 1 && node_id != leader {
                             to_send.insert(
                                 parent,
@@ -320,6 +379,10 @@ fn sync_ghs(nodes: &HashMap<i32, Node>, node_id: i32) {
                                 },
                             );
                         } else if weights_received.len() == span_edges.len() && node_id == leader {
+                            println!(
+                                "\tConverged on min weight edge: {:?}",
+                                global_min_weight_out_edge
+                            );
                             for n in &span_edges {
                                 if *n != parent {
                                     to_send.insert(
@@ -335,10 +398,16 @@ fn sync_ghs(nodes: &HashMap<i32, Node>, node_id: i32) {
                                     );
                                 }
                             }
+                        } else {
+                            println!(
+                                "\tWaiting for more weights {weights_received:?} {span_edges:?}"
+                            );
                         }
                     }
                     MessageType::BroadcastMinWeight(min_id, weight) => {
                         if min_id == node_id {
+                            min_weight_out_edge = (min_id, weight);
+                            println!("\tI have the min weight edge: {:?} ", min_weight_out_edge);
                             to_send.insert(
                                 min_weight_out_edge.0,
                                 Message {
@@ -364,13 +433,19 @@ fn sync_ghs(nodes: &HashMap<i32, Node>, node_id: i32) {
                                 }
                             }
                         }
-                    }
+                    },
 
                     // 5 -> join -> 7
                     // 7 -> join -> 5
                     MessageType::Join => {
                         span_edges.insert(msg.sender);
+                        println!(
+                            "\tJoining node: {} MWOE: {:?}",
+                            msg.sender, min_weight_out_edge
+                        );
                         if msg.sender == min_weight_out_edge.0 && msg.sender < node_id {
+                            println!("\tI am the new leader!");
+                            start_next_phase = true;
                             leader = node_id;
                             parent = node_id;
                             for n in &span_edges {
@@ -385,14 +460,57 @@ fn sync_ghs(nodes: &HashMap<i32, Node>, node_id: i32) {
                                     );
                                 }
                             }
+                        } else if start_next_phase {
+                            to_send.insert(
+                                parent,
+                                Message {
+                                    msg_type: MessageType::BroadcastNewLeader(leader),
+                                    sender: node_id,
+                                    receiver: parent,
+                                },
+                            );
                         }
                     }
-                    _ => {}
+                    MessageType::Done => {
+                        println!("{} is done", id);
+                        done.insert(*id);
+                    }
+                    MessageType::Stop => {
+                        stream
+                            .shutdown(Shutdown::Both)
+                            .expect("shutdown call failed");
+                    }
+                    MessageType::Sync => {}
                 }
             }
         }
         for (id, stream) in &mut streams {
-            if start_next_level && to_send.is_empty() && *id == node.edges[(last_edge_checked + 1) as usize].0 {
+            if last_edge_checked == (node.edges.len()) as i32 && !stop.contains(id) {
+                send_message(
+                    Message {
+                        msg_type: MessageType::Done,
+                        sender: node_id,
+                        receiver: *id,
+                    },
+                    stream,
+                );
+                stop.insert(*id);
+                // continue;
+            } else if span_edges.contains(&node.edges[last_edge_checked as usize].0) {
+                last_edge_checked += 1;
+                continue;
+            }
+
+            if start_next_phase
+                && to_send.is_empty()
+                && last_edge_checked < (node.edges.len() - 1) as i32
+                && *id == node.edges[(last_edge_checked + 1) as usize].0
+                && !stop.contains(id)
+            {
+                phase += 1;
+                start_next_phase = false;
+                println!("Starting phase {}", phase);
+                last_edge_checked += 1;
                 to_send.insert(
                     *id,
                     Message {
@@ -401,7 +519,6 @@ fn sync_ghs(nodes: &HashMap<i32, Node>, node_id: i32) {
                         receiver: *id,
                     },
                 );
-                continue;
             }
             if !to_send.contains_key(id) {
                 send_message(
@@ -412,9 +529,10 @@ fn sync_ghs(nodes: &HashMap<i32, Node>, node_id: i32) {
                     },
                     stream,
                 );
+                println!("Sending {} to {}", MessageType::Sync, id);
             } else {
                 let msg = to_send.remove(id).expect("Unable to get message");
-                println!("Sending message: {:?}", msg);
+                println!("Sending message: {} to {}", msg.msg_type, id);
                 send_message(msg, stream);
             }
         }
