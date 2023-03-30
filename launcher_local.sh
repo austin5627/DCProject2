@@ -1,7 +1,7 @@
 #!/bin/bash
 
 CONFIG_LOCAL=./config_local.txt
-BINARY_DIR=./target/x86_64-unknown-linux-musl/release/
+BINARY_DIR=./target/debug/
 PROGRAM=project2
 
 cargo build || exit 1

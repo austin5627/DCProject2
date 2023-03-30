@@ -232,7 +232,7 @@ fn sync_ghs(nodes: &HashMap<i32, Node>, node_id: i32) {
     let node = nodes.get(&node_id).expect("Unable to find node id");
     let mut streams = connect_to_neighbors(node_id, &nodes);
     // level 0 is each node by itself
-    println!("Node {} is connected to {:?}", node_id, node.edges);
+    println!("Node {} is connected to {:?}", node_id, node.edges.iter().map(|e| e.0).collect::<Vec<i32>>());
 
     let mut leader = node_id;
 
@@ -259,11 +259,11 @@ fn sync_ghs(nodes: &HashMap<i32, Node>, node_id: i32) {
     // Send search message to first neighbor and sync to the rest
     for i in 0..node.edges.len() {
         let msg = if i == 0 {
+            println!("{} Sending {} to {}", node_id, Message::Search, node.edges[i].0);
             Message::Search
         } else {
             Message::Sync
         };
-        println!("Sending {} to {}", msg, node.edges[i].0);
         send_message(
             msg,
             streams
@@ -302,7 +302,7 @@ fn sync_ghs(nodes: &HashMap<i32, Node>, node_id: i32) {
                         } else {
                             next_edge += 1;
                             unchecked_edges.remove(id);
-                            if next_edge < node.edges.len() - 1 {
+                            if next_edge < node.edges.len() {
                                 while !unchecked_edges.contains(&node.edges[next_edge].0) {
                                     next_edge += 1;
                                 }
@@ -481,25 +481,28 @@ fn sync_ghs(nodes: &HashMap<i32, Node>, node_id: i32) {
         }
 
         for (id, stream) in &mut streams {
-            let msg: Message = if let Some(msgs) = to_send.get(id) {
+            let msg: Message;
+            if let Some(msgs) = to_send.get_mut(id) {
                 if let Some(m) = msgs.first() {
                     println!("{} Sending {} to {}", node_id, m, id);
                     if m == &Message::Join {
                         join_sent = Some(*id);
+                        unchecked_edges.remove(id);
                     }
-                    *m
+                    msg = m.clone();
+                    msgs.remove(0);
                 } else {
-                    Message::Sync
+                    msg = Message::Sync;
+                    to_send.remove(id);
                 }
             } else {
-                Message::Sync
-            };
+                msg = Message::Sync;
+            }
 
             if let Err(_) = send_message(msg, stream) {
                 break 'outer;
             }
         }
-        to_send.clear();
     }
     println!("{} Quitting", node_id);
     println!("\n\n\n");
