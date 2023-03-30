@@ -2,7 +2,7 @@
     "configurations": [
         {
             "name": "run all",
-            "command": "./launch.sh",
+            "command": "./launcher.sh",
             "term_opts": {
                 "close_on_exit": true
             },

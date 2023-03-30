@@ -250,8 +250,6 @@ fn sync_ghs(nodes: &HashMap<i32, Node>, node_id: i32) {
     let mut confirm: HashSet<i32> = HashSet::new();
 
     let mut start_next_phase = false;
-    let mut phase = 0;
-    let mut round = 0;
 
     let mut broadcast: Option<Message> = None;
     let mut to_send: HashMap<i32, Vec<Message>> = HashMap::new();
@@ -461,7 +459,6 @@ fn sync_ghs(nodes: &HashMap<i32, Node>, node_id: i32) {
             }
             start_next_phase = false;
             min_weight_out_edge = (-1, -1, i32::MAX);
-            phase += 1;
         }
 
         if let Some(j_id) = join_sent {
